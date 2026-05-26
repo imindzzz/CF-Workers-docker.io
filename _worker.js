@@ -1,88 +1,58 @@
 export default {
   async fetch(request) {
-    const url = new URL(request.url);
-
-    if (url.pathname.startsWith("/abc/")) {
-      return json({
-        status: "success",
-        result: "nginx json",
-      });
-    }
-
-    const host = url.hostname;
-    const match = host.match(/^tsock([^.]+)\.proxy\..*$/);
-
-    if (!match) {
-      return new Response("Invalid host", { status: 400 });
-    }
-
-    const region = match[1];
-    const upstreamUrl = new URL(request.url);
-    upstreamUrl.hostname = `tsock.${region}.twilio.com`;
-    upstreamUrl.protocol = "https:";
-
     const upgrade = request.headers.get("Upgrade");
-    if (upgrade && upgrade.toLowerCase() === "websocket") {
-      return handleWebSocket(request, upstreamUrl, host);
+    if (upgrade !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 426 });
     }
-
-    return handleHttp(request, upstreamUrl, host);
+    const clientPair = new WebSocketPair();
+    const client = clientPair[0];
+    const workerSocket = clientPair[1];
+    workerSocket.accept();
+    let upstream;
+    try {
+      upstream = new WebSocket("wss://tsock.us1.twilio.com/v3/wsconnect");
+      upstream.accept();
+    } catch (err) {
+      workerSocket.close(1011, "Upstream connection failed");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    workerSocket.addEventListener("message", (event) => {
+      try {
+        upstream.send(event.data);
+      } catch (_) {
+        workerSocket.close(1011, "Failed to send upstream");
+      }
+    });
+    upstream.addEventListener("message", (event) => {
+      try {
+        workerSocket.send(event.data);
+      } catch (_) {
+        upstream.close(1011, "Failed to send downstream");
+      }
+    });
+    workerSocket.addEventListener("close", (event) => {
+      try {
+        upstream.close(event.code, event.reason);
+      } catch (_) {}
+    });
+    upstream.addEventListener("close", (event) => {
+      try {
+        workerSocket.close(event.code, event.reason);
+      } catch (_) {}
+    });
+    workerSocket.addEventListener("error", () => {
+      try {
+        upstream.close(1011, "Client socket error");
+      } catch (_) {}
+    });
+    upstream.addEventListener("error", () => {
+      try {
+        workerSocket.close(1011, "Upstream socket error");
+      } catch (_) {}
+    });
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
   },
-};
-
-function json(data, init = {}) {
-  return new Response(JSON.stringify(data), {
-    status: init.status || 200,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      ...(init.headers || {}),
-    },
-  });
-}
-
-function buildProxyHeaders(request, originalHost) {
-  const headers = new Headers(request.headers);
-
-  const clientIp =
-    request.headers.get("cf-connecting-ip") ||
-    request.headers.get("x-forwarded-for") ||
-    "";
-
-  if (clientIp) {
-    headers.set("x-forwarded-for", clientIp);
-  }
-
-  headers.set("x-forwarded-host", originalHost);
-  headers.set("x-forwarded-proto", "https");
-
-  // Let Cloudflare/fetch set the correct upstream Host header.
-  headers.delete("host");
-
-  return headers;
-}
-
-async function handleHttp(request, upstreamUrl, originalHost) {
-  const headers = buildProxyHeaders(request, originalHost);
-
-  const upstreamRequest = new Request(upstreamUrl.toString(), {
-    method: request.method,
-    headers,
-    body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-    redirect: "manual",
-  });
-
-  return fetch(upstreamRequest);
-}
-
-async function handleWebSocket(request, upstreamUrl, originalHost) {
-  const headers = buildProxyHeaders(request, originalHost);
-
-  // Upstream websocket handshake goes through fetch with https URL and Upgrade header.
-  const upstreamRequest = new Request(upstreamUrl.toString(), {
-    method: request.method,
-    headers,
-    redirect: "manual",
-  });
-
-  return fetch(upstreamRequest);
 }
